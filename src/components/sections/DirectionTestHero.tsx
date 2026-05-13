@@ -1,10 +1,19 @@
-import { animate, motion, useMotionValue, useMotionValueEvent, useReducedMotion, useSpring } from "framer-motion";
+import {
+  animate,
+  motion,
+  useMotionValue,
+  useMotionValueEvent,
+  useReducedMotion,
+  useSpring,
+  useTransform,
+} from "framer-motion";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, MouseEvent, PointerEvent } from "react";
 
 type DirectionIntent = "valley" | "neutral" | "soil";
 type CommittedDirection = "valley" | "soil" | null;
 type ReversalPhase = "idle" | "exploring" | "committed" | "expected-path" | "pause" | "reversal" | "thesis";
+type InteractionPhase = "idle" | "dragging" | "leaning" | "committed" | "reversing" | "thesis";
 
 type HeroContent = {
   status: string;
@@ -28,21 +37,24 @@ const RIGHT_CONSEQUENCES = ["Capital", "Velocity", "Visibility", "Exit logic"];
 const LEFT_CONSEQUENCES = ["Autonomy", "Locality", "Apprenticeship", "Permanence"];
 const RIGHT_WORLD_LABELS = ["VC", "Scale fast", "Prestige", "IPO", "Exit"];
 const LEFT_WORLD_LABELS = ["Soil", "Schools", "Patience", "Build forever", "Locality"];
-const RIGHT_COMMIT_THRESHOLD = 0.56;
-const LEFT_COMMIT_THRESHOLD = -0.56;
-const RIGHT_INTENT_THRESHOLD = 0.18;
-const LEFT_INTENT_THRESHOLD = -0.18;
+const COMMIT_THRESHOLD = 0.35;
+const NEUTRAL_THRESHOLD = 0.15;
+const SOFT_VALLEY_PROGRESS = 0.52;
+const SOFT_SOIL_PROGRESS = -0.6;
+const COMMITTED_VALLEY_PROGRESS = 0.82;
+const COMMITTED_SOIL_PROGRESS = -0.78;
+const THESIS_SOIL_PROGRESS = -0.58;
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
 const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
 const deriveIntent = (value: number): DirectionIntent => {
-  if (value >= RIGHT_INTENT_THRESHOLD) {
+  if (value >= NEUTRAL_THRESHOLD) {
     return "valley";
   }
 
-  if (value <= LEFT_INTENT_THRESHOLD) {
+  if (value <= -NEUTRAL_THRESHOLD) {
     return "soil";
   }
 
@@ -83,7 +95,7 @@ const HERO_COPY = {
     body: "Village becomes city. City becomes prestige. Prestige becomes the script.",
     prompt: "It feels efficient because the system was designed to make it feel inevitable.",
     pathTitle: "Path under your hands",
-    pathBody: "Village → City → IIT → Princeton → Silicon Valley → IPO",
+    pathBody: "Village -> City -> IIT -> Princeton -> Silicon Valley -> IPO",
     pathSteps: RIGHT_PATH,
     afterTitle: "What this path optimizes",
     afterHeadline: "Attractive. Fast. Slightly unstable.",
@@ -96,7 +108,7 @@ const HERO_COPY = {
     body: "Silicon Valley gives way to Tamil Nadu, then to Tenkasi, then to the village itself.",
     prompt: "Not retreat. A choice to move ambition closer to apprenticeship, schools, and soil.",
     pathTitle: "Path under your hands",
-    pathBody: "Silicon Valley → Tamil Nadu → Tenkasi → Mathalamparai",
+    pathBody: "Silicon Valley -> Tamil Nadu -> Tenkasi -> Mathalamparai",
     pathSteps: LEFT_PATH,
     afterTitle: "What this path protects",
     afterHeadline: "Slower. Stronger. More owned.",
@@ -135,7 +147,7 @@ const HERO_COPY = {
     body: "Sridhar Vembu. Founder of Zoho. $6B. No VC. No IPO. No exit.",
     prompt: "He moved from Silicon Valley to a Tamil village because the work itself belonged there.",
     pathTitle: "Path under your hands",
-    pathBody: "Silicon Valley → Tamil Nadu → Tenkasi → Mathalamparai",
+    pathBody: "Silicon Valley -> Tamil Nadu -> Tenkasi -> Mathalamparai",
     pathSteps: LEFT_PATH,
     afterTitle: "After the turn",
     afterHeadline: "He went the other way.",
@@ -231,45 +243,209 @@ export const DirectionTestHero = () => {
   const trackRef = useRef<HTMLDivElement>(null);
   const sequenceIdRef = useRef(0);
   const mountedRef = useRef(true);
+  const dragCleanupRef = useRef<{ userSelect: string; webkitUserSelect: string; overscrollBehaviorX: string } | null>(null);
   const [directionIntent, setDirectionIntent] = useState<DirectionIntent>("neutral");
   const [committedDirection, setCommittedDirection] = useState<CommittedDirection>(null);
   const [reversalPhase, setReversalPhase] = useState<ReversalPhase>("idle");
+  const [interactionPhase, setInteractionPhase] = useState<InteractionPhase>("idle");
   const [narrativeBeat, setNarrativeBeat] = useState(0);
   const [dragging, setDragging] = useState(false);
   const [isKeyboardMode, setIsKeyboardMode] = useState(false);
   const [showHint, setShowHint] = useState(false);
-  const [dragProgressState, setDragProgressState] = useState(0);
+  const [maxDrag, setMaxDrag] = useState(140);
 
-  const rawProgress = useMotionValue(0);
-  const dragProgress = useSpring(rawProgress, {
-    stiffness: shouldReduceMotion ? 420 : 180,
-    damping: shouldReduceMotion ? 44 : 24,
-    mass: shouldReduceMotion ? 0.3 : 0.7,
-  });
+  const maxDragRef = useRef(maxDrag);
+  const draggingRef = useRef(false);
+  const directionIntentRef = useRef<DirectionIntent>("neutral");
+  const committedDirectionRef = useRef<CommittedDirection>(null);
+  const reversalPhaseRef = useRef<ReversalPhase>("idle");
+
+  const springConfig = shouldReduceMotion
+    ? { type: "spring" as const, stiffness: 420, damping: 44, mass: 0.4 }
+    : { type: "spring" as const, stiffness: 180, damping: 28, mass: 1.1 };
+
+  const x = useMotionValue(0);
+  const smoothX = useSpring(x, springConfig);
+  const progress = useTransform(smoothX, (latest) =>
+    maxDragRef.current > 0 ? clamp(latest / maxDragRef.current, -1, 1) : 0,
+  );
+  const positiveProgress = useTransform(progress, (latest) => clamp(latest, 0, 1));
+  const negativeProgress = useTransform(progress, (latest) => clamp(-latest, 0, 1));
+  const valleyIntensity = useTransform(progress, [0, 1], [0, 1]);
+  const soilIntensity = useTransform(progress, [-1, 0], [1, 0]);
+  const unresolvedIntensity = useTransform(progress, (latest) => 1 - Math.min(Math.abs(latest), 1));
+  const rightOvercommit = useTransform(progress, (latest) => clamp((latest - 0.62) / 0.26, 0, 1));
+  const leftSettling = useTransform(progress, (latest) => clamp((-latest - 0.48) / 0.36, 0, 1));
+  const fillOpacity = useTransform(progress, (latest) => 0.45 + Math.min(Math.abs(latest), 1) * 0.55);
+  const soilCardY = useTransform(soilIntensity, [0, 1], [0, -8]);
+  const soilCardOpacity = useTransform(soilIntensity, [0, 1], [0.66, 1]);
+  const valleyCardY = useTransform(valleyIntensity, [0, 1], [0, -8]);
+  const valleyCardOpacity = useTransform(valleyIntensity, [0, 1], [0.66, 1]);
+
+  useEffect(() => {
+    directionIntentRef.current = directionIntent;
+  }, [directionIntent]);
+
+  useEffect(() => {
+    committedDirectionRef.current = committedDirection;
+  }, [committedDirection]);
+
+  useEffect(() => {
+    reversalPhaseRef.current = reversalPhase;
+  }, [reversalPhase]);
+
+  useEffect(() => {
+    draggingRef.current = dragging;
+  }, [dragging]);
+
+  useEffect(() => {
+    maxDragRef.current = maxDrag;
+  }, [maxDrag]);
+
+  useEffect(() => {
+    const track = trackRef.current;
+    if (!track) {
+      return;
+    }
+
+    const updateBounds = () => {
+      const nextMaxDrag = Math.max(track.getBoundingClientRect().width / 2 - 32, 44);
+      maxDragRef.current = nextMaxDrag;
+      setMaxDrag((current) => (Math.abs(current - nextMaxDrag) > 1 ? nextMaxDrag : current));
+    };
+
+    updateBounds();
+
+    const observer = new ResizeObserver(updateBounds);
+    observer.observe(track);
+    window.addEventListener("resize", updateBounds);
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateBounds);
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
       mountedRef.current = false;
       sequenceIdRef.current += 1;
+
+      if (dragCleanupRef.current) {
+        document.body.style.userSelect = dragCleanupRef.current.userSelect;
+        document.body.style.webkitUserSelect = dragCleanupRef.current.webkitUserSelect;
+        document.body.style.overscrollBehaviorX = dragCleanupRef.current.overscrollBehaviorX;
+      }
     };
   }, []);
 
-  useMotionValueEvent(dragProgress, "change", (value) => {
-    const next = clamp(value, -1, 1);
-    setDragProgressState(next);
+  const stopInteractiveSequence = () => {
+    sequenceIdRef.current += 1;
+  };
 
-    if (committedDirection) {
+  const setStableDirectionIntent = (nextIntent: DirectionIntent) => {
+    directionIntentRef.current = nextIntent;
+    setDirectionIntent((current) => (current === nextIntent ? current : nextIntent));
+  };
+
+  const setStableCommittedDirection = (nextDirection: CommittedDirection) => {
+    committedDirectionRef.current = nextDirection;
+    setCommittedDirection((current) => (current === nextDirection ? current : nextDirection));
+  };
+
+  const setStableReversalPhase = (nextPhase: ReversalPhase) => {
+    reversalPhaseRef.current = nextPhase;
+    setReversalPhase((current) => (current === nextPhase ? current : nextPhase));
+  };
+
+  const setStableDragging = (nextDragging: boolean) => {
+    draggingRef.current = nextDragging;
+    setDragging((current) => (current === nextDragging ? current : nextDragging));
+  };
+
+  const beginPointerSession = () => {
+    if (typeof document === "undefined" || dragCleanupRef.current) {
       return;
     }
 
-    const nextIntent = deriveIntent(next);
-    setDirectionIntent(nextIntent);
+    dragCleanupRef.current = {
+      userSelect: document.body.style.userSelect,
+      webkitUserSelect: document.body.style.webkitUserSelect,
+      overscrollBehaviorX: document.body.style.overscrollBehaviorX,
+    };
 
-    if (dragging || nextIntent !== "neutral") {
-      setReversalPhase(nextIntent === "neutral" ? "idle" : "exploring");
-    } else {
-      setReversalPhase("idle");
+    document.body.style.userSelect = "none";
+    document.body.style.webkitUserSelect = "none";
+    document.body.style.overscrollBehaviorX = "none";
+  };
+
+  const endPointerSession = () => {
+    if (typeof document === "undefined" || !dragCleanupRef.current) {
+      return;
     }
+
+    document.body.style.userSelect = dragCleanupRef.current.userSelect;
+    document.body.style.webkitUserSelect = dragCleanupRef.current.webkitUserSelect;
+    document.body.style.overscrollBehaviorX = dragCleanupRef.current.overscrollBehaviorX;
+    dragCleanupRef.current = null;
+  };
+
+  const animateToProgress = async (targetProgress: number, transition = springConfig) => {
+    const nextProgress = clamp(targetProgress, -1, 1);
+    const targetX = nextProgress * maxDragRef.current;
+
+    if (shouldReduceMotion) {
+      x.set(targetX);
+      return;
+    }
+
+    await animate(x, targetX, transition).finished;
+  };
+
+  const updateProgressFromClientX = (clientX: number) => {
+    const track = trackRef.current;
+    if (!track) {
+      return 0;
+    }
+
+    const rect = track.getBoundingClientRect();
+    const safeMaxDrag = Math.max(rect.width / 2 - 32, 44);
+    const centerX = rect.left + rect.width / 2;
+    const normalized = clamp((clientX - centerX) / safeMaxDrag, -1, 1);
+    const resisted = applyResistance(normalized);
+
+    if (Math.abs(safeMaxDrag - maxDragRef.current) > 1) {
+      maxDragRef.current = safeMaxDrag;
+      setMaxDrag(safeMaxDrag);
+    }
+
+    x.set(resisted * safeMaxDrag);
+    return resisted;
+  };
+
+  const syncIntentFromProgress = (nextProgress: number) => {
+    if (committedDirectionRef.current || reversalPhaseRef.current === "thesis") {
+      return;
+    }
+
+    const nextIntent = deriveIntent(nextProgress);
+    const nextPhase = nextIntent === "neutral" ? "idle" : "exploring";
+
+    if (nextIntent !== directionIntentRef.current) {
+      setStableDirectionIntent(nextIntent);
+    }
+
+    if (nextPhase !== reversalPhaseRef.current) {
+      setStableReversalPhase(nextPhase);
+    }
+
+    if (!draggingRef.current) {
+      setInteractionPhase(nextIntent === "neutral" ? "idle" : "leaning");
+    }
+  };
+
+  useMotionValueEvent(progress, "change", (latest) => {
+    syncIntentFromProgress(clamp(latest, -1, 1));
   });
 
   useEffect(() => {
@@ -282,103 +458,94 @@ export const DirectionTestHero = () => {
     return () => window.clearTimeout(timer);
   }, [committedDirection, dragging, reversalPhase, shouldReduceMotion]);
 
-  const valleyIntensity = clamp(dragProgressState / 0.84, 0, 1);
-  const soilIntensity = clamp(-dragProgressState / 0.84, 0, 1);
-  const unresolvedIntensity = 1 - Math.max(valleyIntensity, soilIntensity);
-  const rightOvercommit = clamp((dragProgressState - 0.62) / 0.26, 0, 1);
-  const leftSettling = clamp((-dragProgressState - 0.48) / 0.36, 0, 1);
-  const content = getHeroContent(directionIntent, committedDirection, reversalPhase, narrativeBeat);
-  const activePathSteps = content.pathSteps;
-  const currentThumbPosition = toPercent(dragProgressState);
-
-  const stopInteractiveSequence = () => {
-    sequenceIdRef.current += 1;
-  };
-
-  const animateProgress = async (target: number, duration: number, ease: number[]) => {
-    await animate(rawProgress, target, {
-      duration: shouldReduceMotion ? 0.01 : duration,
-      ease,
-    }).finished;
-  };
-
-  const updateProgressFromClientX = (clientX: number) => {
-    const track = trackRef.current;
-    if (!track) {
-      return;
-    }
-
-    const rect = track.getBoundingClientRect();
-    const ratio = clamp((clientX - rect.left) / rect.width, 0, 1);
-    const normalized = ratio * 2 - 1;
-    rawProgress.set(applyResistance(normalized));
-  };
-
   const resetInteraction = async () => {
     stopInteractiveSequence();
-    setDragging(false);
+    endPointerSession();
+    setStableDragging(false);
     setShowHint(false);
     setNarrativeBeat(0);
-    setCommittedDirection(null);
-    setDirectionIntent("neutral");
-    setReversalPhase("idle");
-    await animateProgress(0, 0.42, [0.22, 1, 0.36, 1]);
+    setStableCommittedDirection(null);
+    setStableDirectionIntent("neutral");
+    setStableReversalPhase("idle");
+    setInteractionPhase("idle");
+    await animateToProgress(0);
+  };
+
+  const leanDirection = async (direction: Exclude<DirectionIntent, "neutral">) => {
+    stopInteractiveSequence();
+    endPointerSession();
+    setStableDragging(false);
+    setShowHint(false);
+    setStableCommittedDirection(null);
+    setStableDirectionIntent(direction);
+    setStableReversalPhase("exploring");
+    setInteractionPhase("leaning");
+    await animateToProgress(direction === "valley" ? SOFT_VALLEY_PROGRESS : SOFT_SOIL_PROGRESS);
   };
 
   const commitDirection = async (direction: Exclude<CommittedDirection, null>) => {
     const runId = sequenceIdRef.current + 1;
     sequenceIdRef.current = runId;
-    setDragging(false);
+    endPointerSession();
+    setStableDragging(false);
     setShowHint(false);
-    setCommittedDirection(direction);
-    setDirectionIntent(direction);
+    setStableCommittedDirection(direction);
+    setStableDirectionIntent(direction);
     setNarrativeBeat(0);
-    setReversalPhase("committed");
+    setStableReversalPhase("committed");
+    setInteractionPhase("committed");
 
     if (direction === "valley") {
-      await animateProgress(0.82, 0.5, [0.22, 1, 0.36, 1]);
+      await animateToProgress(COMMITTED_VALLEY_PROGRESS);
       if (!mountedRef.current || sequenceIdRef.current !== runId) {
         return;
       }
 
-      setReversalPhase("expected-path");
+      setStableReversalPhase("expected-path");
       setNarrativeBeat(1);
       await sleep(shouldReduceMotion ? 40 : 650);
       if (!mountedRef.current || sequenceIdRef.current !== runId) {
         return;
       }
 
-      setReversalPhase("pause");
+      setStableReversalPhase("pause");
       setNarrativeBeat(2);
       await sleep(shouldReduceMotion ? 40 : 700);
       if (!mountedRef.current || sequenceIdRef.current !== runId) {
         return;
       }
 
-      setReversalPhase("reversal");
+      setStableReversalPhase("reversal");
+      setInteractionPhase("reversing");
       setNarrativeBeat(3);
-      await animateProgress(0.9, 0.18, [0.2, 1, 0.3, 1]);
+      await animateToProgress(0.9, {
+        ...springConfig,
+        stiffness: shouldReduceMotion ? 420 : 220,
+        damping: shouldReduceMotion ? 44 : 24,
+      });
       if (!mountedRef.current || sequenceIdRef.current !== runId) {
         return;
       }
 
-      await animateProgress(-0.84, 1.2, [0.76, 0, 0.24, 1]);
+      await animateToProgress(-0.84);
       if (!mountedRef.current || sequenceIdRef.current !== runId) {
         return;
       }
 
-      setReversalPhase("thesis");
+      setStableReversalPhase("thesis");
+      setInteractionPhase("thesis");
       setNarrativeBeat(4);
-      await animateProgress(-0.58, 0.5, [0.22, 1, 0.36, 1]);
+      setStableDirectionIntent("soil");
+      await animateToProgress(THESIS_SOIL_PROGRESS);
       return;
     }
 
-    await animateProgress(-0.78, 0.56, [0.22, 1, 0.36, 1]);
+    await animateToProgress(COMMITTED_SOIL_PROGRESS);
     if (!mountedRef.current || sequenceIdRef.current !== runId) {
       return;
     }
 
-    setReversalPhase("pause");
+    setStableReversalPhase("pause");
     setNarrativeBeat(1);
     await sleep(shouldReduceMotion ? 40 : 620);
     if (!mountedRef.current || sequenceIdRef.current !== runId) {
@@ -391,40 +558,57 @@ export const DirectionTestHero = () => {
       return;
     }
 
-    setReversalPhase("thesis");
+    setStableReversalPhase("thesis");
+    setInteractionPhase("thesis");
     setNarrativeBeat(3);
-    await animateProgress(-0.56, 0.48, [0.22, 1, 0.36, 1]);
+    await animateToProgress(THESIS_SOIL_PROGRESS);
   };
 
-  const maybeCommitFromProgress = async (value: number) => {
-    if (value >= RIGHT_COMMIT_THRESHOLD) {
+  const settleProgress = async (currentProgress: number) => {
+    if (currentProgress >= COMMIT_THRESHOLD) {
       await commitDirection("valley");
       return;
     }
 
-    if (value <= LEFT_COMMIT_THRESHOLD) {
+    if (currentProgress <= -COMMIT_THRESHOLD) {
       await commitDirection("soil");
       return;
     }
 
-    setDirectionIntent("neutral");
-    setReversalPhase("idle");
-    await animateProgress(0, 0.48, [0.22, 1, 0.36, 1]);
-  };
+    setStableCommittedDirection(null);
 
-  const handlePointerDown = (event: PointerEvent<HTMLButtonElement>) => {
-    if (committedDirection || reversalPhase === "thesis") {
+    if (Math.abs(currentProgress) < NEUTRAL_THRESHOLD) {
+      setStableDirectionIntent("neutral");
+      setStableReversalPhase("idle");
+      setInteractionPhase("idle");
+      await animateToProgress(0);
       return;
     }
 
+    const nextIntent = currentProgress > 0 ? "valley" : "soil";
+    setStableDirectionIntent(nextIntent);
+    setStableReversalPhase("exploring");
+    setInteractionPhase("leaning");
+    await animateToProgress(nextIntent === "valley" ? SOFT_VALLEY_PROGRESS : SOFT_SOIL_PROGRESS);
+  };
+
+  const handlePointerDown = (event: PointerEvent<HTMLButtonElement>) => {
+    if (committedDirectionRef.current || reversalPhaseRef.current === "thesis") {
+      return;
+    }
+
+    stopInteractiveSequence();
+    beginPointerSession();
     event.currentTarget.setPointerCapture(event.pointerId);
-    setDragging(true);
+    setStableDragging(true);
+    setInteractionPhase("dragging");
     setIsKeyboardMode(false);
+    setShowHint(false);
     updateProgressFromClientX(event.clientX);
   };
 
   const handlePointerMove = (event: PointerEvent<HTMLButtonElement>) => {
-    if (!dragging || committedDirection || reversalPhase === "thesis") {
+    if (!draggingRef.current || committedDirectionRef.current || reversalPhaseRef.current === "thesis") {
       return;
     }
 
@@ -436,22 +620,24 @@ export const DirectionTestHero = () => {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
 
-    if (!dragging || committedDirection || reversalPhase === "thesis") {
-      setDragging(false);
+    if (!draggingRef.current || committedDirectionRef.current || reversalPhaseRef.current === "thesis") {
+      endPointerSession();
+      setStableDragging(false);
       return;
     }
 
-    setDragging(false);
-    await maybeCommitFromProgress(rawProgress.get());
+    endPointerSession();
+    setStableDragging(false);
+    await settleProgress(clamp(x.get() / maxDragRef.current, -1, 1));
   };
 
   const handleTrackClick = async (event: MouseEvent<HTMLDivElement>) => {
-    if (dragging || committedDirection || reversalPhase === "thesis") {
+    if (draggingRef.current || committedDirectionRef.current || reversalPhaseRef.current === "thesis") {
       return;
     }
 
-    updateProgressFromClientX(event.clientX);
-    await maybeCommitFromProgress(rawProgress.get());
+    const nextProgress = updateProgressFromClientX(event.clientX);
+    await settleProgress(nextProgress);
   };
 
   const handleKeyDown = async (event: KeyboardEvent<HTMLButtonElement>) => {
@@ -463,52 +649,47 @@ export const DirectionTestHero = () => {
       return;
     }
 
-    if (committedDirection || reversalPhase === "thesis") {
+    if (committedDirectionRef.current || reversalPhaseRef.current === "thesis") {
       return;
     }
 
-    if (event.key === "ArrowRight") {
+    if (event.key === "ArrowRight" || event.key === "End") {
       event.preventDefault();
-      rawProgress.set(clamp(rawProgress.get() + 0.18, -1, 1));
+      await leanDirection("valley");
       return;
     }
 
-    if (event.key === "ArrowLeft") {
+    if (event.key === "ArrowLeft" || event.key === "Home") {
       event.preventDefault();
-      rawProgress.set(clamp(rawProgress.get() - 0.18, -1, 1));
+      await leanDirection("soil");
       return;
     }
 
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
-      const currentIntent = deriveIntent(rawProgress.get());
-      if (currentIntent === "valley") {
-        await commitDirection("valley");
+      const currentIntent = deriveIntent(clamp(x.get() / maxDragRef.current, -1, 1));
+
+      if (currentIntent === "neutral") {
         return;
       }
 
-      if (currentIntent === "soil") {
-        await commitDirection("soil");
-        return;
-      }
-
-      await animateProgress(rawProgress.get() >= 0 ? 0.44 : -0.44, 0.24, [0.22, 1, 0.36, 1]);
+      await commitDirection(currentIntent);
     }
   };
 
   const handleNudge = async (direction: "left" | "right") => {
-    if (committedDirection || reversalPhase === "thesis") {
+    if (committedDirectionRef.current || reversalPhaseRef.current === "thesis") {
       return;
     }
 
     setIsKeyboardMode(false);
-    const nextValue = clamp(rawProgress.get() + (direction === "right" ? 0.26 : -0.26), -1, 1);
-    rawProgress.set(nextValue);
-
-    if (shouldReduceMotion) {
-      await maybeCommitFromProgress(nextValue);
-    }
+    await leanDirection(direction === "right" ? "valley" : "soil");
   };
+
+  const content = getHeroContent(directionIntent, committedDirection, reversalPhase, narrativeBeat);
+  const activePathSteps = content.pathSteps;
+  const soilCardMode = committedDirection === "soil" || reversalPhase === "thesis" ? "committed" : directionIntent === "soil" ? "leaning" : "idle";
+  const valleyCardMode = committedDirection === "valley" ? "committed" : directionIntent === "valley" ? "leaning" : "idle";
 
   const interactivePrompt = useMemo(() => {
     if (shouldReduceMotion && !committedDirection && reversalPhase !== "thesis") {
@@ -537,23 +718,51 @@ export const DirectionTestHero = () => {
       return "The thesis lands only after the branch resolves.";
     }
 
-    return isKeyboardMode ? "Arrow keys to lean. Enter or Space to commit. Escape resets." : content.prompt;
+    if (isKeyboardMode) {
+      return "Arrow keys or Home/End lean. Enter or Space commits. Escape resets.";
+    }
+
+    return content.prompt;
   }, [committedDirection, content.prompt, isKeyboardMode, narrativeBeat, reversalPhase, shouldReduceMotion]);
 
+  const sliderValueNow = directionIntent === "soil" ? -1 : directionIntent === "valley" ? 1 : 0;
+  const sliderValueText =
+    interactionPhase === "thesis"
+      ? "Soil chosen. The thesis has landed."
+      : committedDirection === "valley"
+        ? "Valley committed. The expected path is being reversed."
+        : committedDirection === "soil"
+          ? "Soil committed. The rooted path is settling."
+          : directionIntent === "valley"
+            ? "Leaning toward Valley."
+            : directionIntent === "soil"
+              ? "Leaning toward Soil."
+              : "Centered and undecided.";
+
+  const sceneMotionStyles = {
+    ["--progress" as const]: progress,
+    ["--valley" as const]: valleyIntensity,
+    ["--soil" as const]: soilIntensity,
+    ["--unresolved" as const]: unresolvedIntensity,
+    ["--right-overcommit" as const]: rightOvercommit,
+    ["--left-settling" as const]: leftSettling,
+  } as Record<string, unknown>;
+
   return (
-    <section id="hero" data-tone="mixed" className="relative overflow-hidden border-b border-paper/10 bg-background">
+    <motion.section id="hero" data-tone="mixed" className="relative overflow-hidden border-b border-paper/10 bg-background" style={sceneMotionStyles}>
       <div
         aria-hidden="true"
         className="absolute inset-0"
         style={{
-          background: `linear-gradient(120deg, rgba(8,14,28,${0.78 + valleyIntensity * 0.14}) 0%, rgba(18,29,52,${0.52 + valleyIntensity * 0.18}) 38%, rgba(54,37,20,${0.34 + soilIntensity * 0.24}) 62%, rgba(24,16,10,0.95) 100%)`,
+          background:
+            "linear-gradient(120deg, rgb(8 14 28 / calc(0.78 + var(--valley) * 0.14)) 0%, rgb(18 29 52 / calc(0.52 + var(--valley) * 0.18)) 38%, rgb(54 37 20 / calc(0.34 + var(--soil) * 0.24)) 62%, rgb(24 16 10 / 0.95) 100%)",
         }}
       />
       <div
         aria-hidden="true"
         className="absolute inset-0"
         style={{
-          opacity: 0.28 + unresolvedIntensity * 0.16,
+          opacity: "calc(0.28 + var(--unresolved) * 0.16)",
           backgroundImage:
             "radial-gradient(circle at 18% 20%, hsl(var(--silicon-accent) / 0.18), transparent 24%), radial-gradient(circle at 84% 78%, hsl(var(--gold) / 0.16), transparent 30%)",
         }}
@@ -572,38 +781,40 @@ export const DirectionTestHero = () => {
             : { duration: 0.2 }
         }
         style={{
-          opacity: 0.14 + valleyIntensity * 0.42,
-          backgroundImage: `linear-gradient(90deg, rgba(255,255,255,${0.06 + valleyIntensity * 0.12}) 1px, transparent 1px), linear-gradient(180deg, rgba(149,190,255,${0.06 + valleyIntensity * 0.1}) 1px, transparent 1px)`,
-          backgroundSize: `${88 - valleyIntensity * 24}px ${88 - valleyIntensity * 24}px`,
+          opacity: "calc(0.14 + var(--valley) * 0.42)",
+          backgroundImage:
+            "linear-gradient(90deg, rgb(255 255 255 / calc(0.06 + var(--valley) * 0.12)) 1px, transparent 1px), linear-gradient(180deg, rgb(149 190 255 / calc(0.06 + var(--valley) * 0.1)) 1px, transparent 1px)",
+          backgroundSize: "calc(88px - var(--valley) * 24px) calc(88px - var(--valley) * 24px)",
           maskImage: "linear-gradient(90deg, black 0%, black 56%, transparent 84%)",
-          transform: `translateX(${dragProgressState * 18}px) skewX(${rightOvercommit * 4}deg)`,
-          filter: `blur(${rightOvercommit * 1.1}px) saturate(${1 + valleyIntensity * 0.18})`,
+          transform: "translateX(calc(var(--progress) * 18px)) skewX(calc(var(--right-overcommit) * 4deg))",
+          filter: "blur(calc(var(--right-overcommit) * 1.1px)) saturate(calc(1 + var(--valley) * 0.18))",
         }}
       />
       <div
         aria-hidden="true"
         className="absolute inset-0"
         style={{
-          opacity: 0.15 + soilIntensity * 0.54,
+          opacity: "calc(0.15 + var(--soil) * 0.54)",
           backgroundImage:
             "repeating-linear-gradient(142deg, rgba(151,173,80,0.22) 0 2px, transparent 2px 36px), repeating-linear-gradient(44deg, rgba(100,72,37,0.16) 0 1px, transparent 1px 34px), linear-gradient(140deg, rgba(228,190,94,0.18), transparent 32%)",
           maskImage: "linear-gradient(90deg, transparent 18%, black 48%, black 100%)",
-          transform: `translateX(${dragProgressState * 10}px) scale(${1 - soilIntensity * 0.02})`,
-          filter: `saturate(${1 + soilIntensity * 0.32}) blur(${(1 - leftSettling) * 0.8}px)`,
+          transform: "translateX(calc(var(--progress) * 10px)) scale(calc(1 - var(--soil) * 0.02))",
+          filter: "saturate(calc(1 + var(--soil) * 0.32)) blur(calc((1 - var(--left-settling)) * 0.8px))",
         }}
       />
       <div
         aria-hidden="true"
         className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2"
         style={{
-          background: `linear-gradient(180deg, transparent, rgba(228,190,94,${0.18 + Math.max(valleyIntensity, soilIntensity) * 0.32}), transparent)`,
+          opacity: "calc(0.18 + max(var(--valley), var(--soil)) * 0.32)",
+          background: "linear-gradient(180deg, transparent, rgb(228 190 94 / 1), transparent)",
         }}
       />
       <div
         aria-hidden="true"
         className="absolute inset-0"
         style={{
-          opacity: 0.12 + leftSettling * 0.3,
+          opacity: "calc(0.12 + var(--left-settling) * 0.3)",
           background:
             "radial-gradient(circle at 66% 58%, hsl(var(--gold) / 0.24), transparent 18%), radial-gradient(circle at 74% 74%, hsl(var(--field-bright) / 0.14), transparent 20%)",
         }}
@@ -630,19 +841,10 @@ export const DirectionTestHero = () => {
             >
               {ENGLISH_PROMPT}
             </motion.p>
-            <motion.div
-              initial={false}
-              animate={{ opacity: 1, y: 0 }}
-              className="mt-8 max-w-3xl"
-              aria-live="polite"
-            >
+            <motion.div initial={false} animate={{ opacity: 1, y: 0 }} className="mt-8 max-w-3xl" aria-live="polite">
               <div className="font-mono text-[10px] uppercase tracking-[0.35em] text-paper/52">{content.eyebrow}</div>
-              <h2 className="mt-3 font-display text-[clamp(2.8rem,7vw,5.8rem)] italic leading-[0.96] text-paper">
-                {content.title}
-              </h2>
-              <p className="mt-5 max-w-2xl font-serif-body text-base leading-relaxed text-paper/78 md:text-lg">
-                {content.body}
-              </p>
+              <h2 className="mt-3 font-display text-[clamp(2.8rem,7vw,5.8rem)] italic leading-[0.96] text-paper">{content.title}</h2>
+              <p className="mt-5 max-w-2xl font-serif-body text-base leading-relaxed text-paper/78 md:text-lg">{content.body}</p>
             </motion.div>
           </div>
 
@@ -654,10 +856,7 @@ export const DirectionTestHero = () => {
         </div>
 
         <div className="grid gap-8 pb-10 pt-10 lg:grid-cols-[0.92fr_1.2fr_0.92fr] lg:items-end">
-          <motion.div
-            className="space-y-4"
-            animate={{ y: shouldReduceMotion ? 0 : soilIntensity * -8, opacity: 0.66 + soilIntensity * 0.34 }}
-          >
+          <motion.div className="space-y-4" style={{ y: soilCardY, opacity: soilCardOpacity }}>
             <div className="font-mono text-[10px] uppercase tracking-[0.35em] text-gold/75">Consequence card · rooted path</div>
             <div className="rounded-[1.3rem] border border-gold/20 bg-soil-dark/50 p-5 reverse-shadow backdrop-blur-sm">
               <div className="flex items-start justify-between gap-3">
@@ -668,12 +867,12 @@ export const DirectionTestHero = () => {
                   </p>
                 </div>
                 <div className="rounded-full border border-gold/20 bg-gold/10 px-3 py-1 font-mono text-[10px] uppercase tracking-[0.28em] text-gold/90">
-                  {Math.round(soilIntensity * 100)}%
+                  {soilCardMode === "committed" ? "settled" : soilCardMode === "leaning" ? "warming" : "latent"}
                 </div>
               </div>
               <div className="mt-5 grid grid-cols-2 gap-2">
                 {LEFT_CONSEQUENCES.map((label, index) => {
-                  const active = soilIntensity > index * 0.16 || committedDirection === "soil" || reversalPhase === "thesis";
+                  const active = soilCardMode === "committed" ? true : soilCardMode === "leaning" ? index < 2 : false;
                   return (
                     <div
                       key={label}
@@ -706,7 +905,8 @@ export const DirectionTestHero = () => {
                     aria-hidden="true"
                     className="absolute inset-0"
                     style={{
-                      background: `linear-gradient(90deg, rgba(38,87,173,${0.1 + valleyIntensity * 0.32}) 0%, rgba(20,24,41,0.08) 44%, rgba(172,124,63,${0.08 + soilIntensity * 0.34}) 100%)`,
+                      background:
+                        "linear-gradient(90deg, rgb(38 87 173 / calc(0.1 + var(--valley) * 0.32)) 0%, rgb(20 24 41 / 0.08) 44%, rgb(172 124 63 / calc(0.08 + var(--soil) * 0.34)) 100%)",
                     }}
                   />
                   <div className="relative">
@@ -715,53 +915,68 @@ export const DirectionTestHero = () => {
                       <span>Valley</span>
                     </div>
 
-                    <div ref={trackRef} onClick={handleTrackClick} className="relative mt-5 h-24 cursor-pointer touch-pan-y">
+                    <div ref={trackRef} onClick={handleTrackClick} className="relative mt-5 h-24 cursor-pointer touch-pan-y select-none">
                       <div className="absolute left-0 right-0 top-1/2 h-px -translate-y-1/2 bg-paper/16" />
                       <div
                         aria-hidden="true"
                         className="absolute left-0 top-1/2 h-2 w-2 -translate-y-1/2 rounded-full bg-gold/50"
-                        style={{ transform: `translateY(-50%) translateX(calc(${toPercent(-0.56)} - 0.25rem))` }}
+                        style={{ transform: `translateY(-50%) translateX(calc(${toPercent(-COMMIT_THRESHOLD)} - 0.25rem))` }}
                       />
                       <div
                         aria-hidden="true"
                         className="absolute top-1/2 h-2 w-2 -translate-y-1/2 rounded-full bg-silicon-accent/70"
-                        style={{ left: toPercent(0.56), transform: "translate(-50%, -50%)" }}
+                        style={{ left: toPercent(COMMIT_THRESHOLD), transform: "translate(-50%, -50%)" }}
                       />
 
                       <motion.div
                         aria-hidden="true"
-                        className="absolute top-1/2 h-1.5 rounded-full bg-gradient-to-r from-gold via-paper to-silicon-accent"
-                        style={{
-                          left: dragProgressState >= 0 ? "50%" : currentThumbPosition,
-                          right: dragProgressState >= 0 ? `${50 - dragProgressState * 50}%` : "50%",
-                          opacity: 0.45 + Math.max(valleyIntensity, soilIntensity) * 0.55,
-                        }}
+                        className="absolute right-1/2 top-1/2 h-1.5 w-1/2 origin-right -translate-y-1/2 bg-gradient-to-l from-paper via-paper to-gold"
+                        style={{ scaleX: negativeProgress, opacity: fillOpacity }}
+                      />
+                      <motion.div
+                        aria-hidden="true"
+                        className="absolute left-1/2 top-1/2 h-1.5 w-1/2 origin-left -translate-y-1/2 bg-gradient-to-r from-paper via-paper to-silicon-accent"
+                        style={{ scaleX: positiveProgress, opacity: fillOpacity }}
                       />
 
                       <div
                         aria-hidden="true"
                         className="absolute inset-y-4 left-[20%] hidden w-px bg-paper/10 md:block"
-                        style={{ opacity: 0.3 + soilIntensity * 0.4 }}
+                        style={{ opacity: "calc(0.3 + var(--soil) * 0.4)" }}
                       />
                       <div
                         aria-hidden="true"
                         className="absolute inset-y-4 right-[20%] hidden w-px bg-paper/10 md:block"
-                        style={{ opacity: 0.3 + valleyIntensity * 0.4 }}
+                        style={{ opacity: "calc(0.3 + var(--valley) * 0.4)" }}
                       />
 
                       <motion.button
                         type="button"
-                        aria-label="Choose the direction ambition should move"
+                        role="slider"
+                        aria-label="Choose the direction ambition moves"
                         aria-describedby="hero-direction-help"
+                        aria-valuemin={-1}
+                        aria-valuemax={1}
+                        aria-valuenow={sliderValueNow}
+                        aria-valuetext={sliderValueText}
                         onPointerDown={handlePointerDown}
                         onPointerMove={handlePointerMove}
                         onPointerUp={handlePointerUp}
                         onPointerCancel={handlePointerUp}
                         onKeyDown={handleKeyDown}
-                        className="absolute top-1/2 z-10 h-16 w-16 -translate-x-1/2 -translate-y-1/2 rounded-full border border-gold/55 bg-soil-dark/90 text-paper shadow-[0_0_45px_hsl(var(--gold)/0.18)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                        style={{ left: currentThumbPosition, touchAction: "none" }}
+                        className={`absolute left-1/2 top-1/2 z-10 h-16 w-16 -translate-x-1/2 -translate-y-1/2 rounded-full border border-gold/55 bg-soil-dark/90 text-paper shadow-[0_0_45px_hsl(var(--gold)/0.18)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold focus-visible:ring-offset-2 focus-visible:ring-offset-background ${
+                          dragging ? "cursor-grabbing" : "cursor-grab"
+                        }`}
+                        style={{ x: smoothX, touchAction: "none" }}
                         animate={{
-                          rotate: reversalPhase === "reversal" ? -168 : dragProgressState > 0 ? 14 + valleyIntensity * 10 : -14 - soilIntensity * 12,
+                          rotate:
+                            reversalPhase === "reversal"
+                              ? -168
+                              : directionIntent === "valley"
+                                ? 16
+                                : directionIntent === "soil"
+                                  ? -18
+                                  : 0,
                           scale: dragging ? 1.08 : committedDirection ? 1.02 : 1,
                           boxShadow:
                             committedDirection === "soil" || reversalPhase === "thesis"
@@ -799,10 +1014,10 @@ export const DirectionTestHero = () => {
                             key={label}
                             className="absolute rounded-full border border-paper/10 bg-silicon-dark/70 px-3 py-1 font-mono text-[10px] uppercase tracking-[0.24em] text-paper/78 backdrop-blur-sm"
                             style={{
-                              opacity: clamp(valleyIntensity - index * 0.12, 0, 1),
+                              opacity: `clamp(0, calc(var(--valley) - ${index * 0.12}), 1)`,
                               top: `${14 + index * 14}%`,
                               left: `${58 + index * 6}%`,
-                              transform: `translateX(${valleyIntensity * (8 + index * 2)}px) scale(${0.9 + valleyIntensity * 0.1})`,
+                              transform: `translateX(calc(var(--valley) * ${8 + index * 2}px)) scale(calc(0.9 + var(--valley) * 0.1))`,
                             }}
                           >
                             {label}
@@ -813,10 +1028,10 @@ export const DirectionTestHero = () => {
                             key={label}
                             className="absolute rounded-full border border-gold/18 bg-soil-dark/72 px-3 py-1 font-mono text-[10px] uppercase tracking-[0.24em] text-gold/92 backdrop-blur-sm"
                             style={{
-                              opacity: clamp(soilIntensity - index * 0.12, 0, 1),
+                              opacity: `clamp(0, calc(var(--soil) - ${index * 0.12}), 1)`,
                               top: `${14 + index * 14}%`,
                               left: `${2 + index * 6}%`,
-                              transform: `translateX(${soilIntensity * -(8 + index * 2)}px) scale(${0.9 + soilIntensity * 0.1})`,
+                              transform: `translateX(calc(var(--soil) * -${8 + index * 2}px)) scale(calc(0.9 + var(--soil) * 0.1))`,
                             }}
                           >
                             {label}
@@ -864,14 +1079,14 @@ export const DirectionTestHero = () => {
                       onClick={() => void commitDirection("valley")}
                       className="inline-flex rounded-full border border-paper/15 bg-paper/5 px-5 py-3 font-mono text-[10px] uppercase tracking-[0.35em] text-paper transition hover:bg-paper/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                     >
-                      Choose expected path
+                      Choose valley path
                     </button>
                     <button
                       type="button"
                       onClick={() => void commitDirection("soil")}
                       className="inline-flex rounded-full border border-gold/35 bg-gold/12 px-5 py-3 font-mono text-[10px] uppercase tracking-[0.35em] text-gold transition hover:bg-gold/18 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gold focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                     >
-                      Choose reverse path
+                      Choose soil path
                     </button>
                   </div>
                 )}
@@ -925,10 +1140,7 @@ export const DirectionTestHero = () => {
             </div>
           </div>
 
-          <motion.div
-            className="space-y-4"
-            animate={{ y: shouldReduceMotion ? 0 : valleyIntensity * -8, opacity: 0.66 + valleyIntensity * 0.34 }}
-          >
+          <motion.div className="space-y-4" style={{ y: valleyCardY, opacity: valleyCardOpacity }}>
             <div className="font-mono text-[10px] uppercase tracking-[0.35em] text-paper/50">Consequence card · expected path</div>
             <div className="rounded-[1.3rem] border border-paper/10 bg-black/20 p-5 reverse-shadow backdrop-blur-sm">
               <div className="flex items-start justify-between gap-3">
@@ -939,12 +1151,12 @@ export const DirectionTestHero = () => {
                   </p>
                 </div>
                 <div className="rounded-full border border-paper/15 bg-paper/5 px-3 py-1 font-mono text-[10px] uppercase tracking-[0.28em] text-paper/78">
-                  {Math.round(valleyIntensity * 100)}%
+                  {valleyCardMode === "committed" ? "charged" : valleyCardMode === "leaning" ? "active" : "latent"}
                 </div>
               </div>
               <div className="mt-5 grid grid-cols-2 gap-2">
                 {RIGHT_CONSEQUENCES.map((label, index) => {
-                  const active = valleyIntensity > index * 0.16 || committedDirection === "valley";
+                  const active = valleyCardMode === "committed" ? true : valleyCardMode === "leaning" ? index < 2 : false;
                   return (
                     <div
                       key={label}
@@ -963,13 +1175,13 @@ export const DirectionTestHero = () => {
 
         <div className="flex flex-wrap items-center justify-between gap-4 border-t border-paper/10 pt-6">
           <div className="font-mono text-[10px] uppercase tracking-[0.32em] text-paper/42">
-            Village → City → IIT → Princeton → Silicon Valley → IPO is the default story.
+            {"Village -> City -> IIT -> Princeton -> Silicon Valley -> IPO is the default story."}
           </div>
           <div className="font-mono text-[10px] uppercase tracking-[0.32em] text-gold/72">
-            Silicon Valley → Tamil Nadu → Tenkasi → Mathalamparai is the thesis.
+            {"Silicon Valley -> Tamil Nadu -> Tenkasi -> Mathalamparai is the thesis."}
           </div>
         </div>
       </div>
-    </section>
+    </motion.section>
   );
 };
